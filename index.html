@@ -38,9 +38,9 @@
 </div>
 
 <div class="panel">
-  <input type="file" id="fileInput" disabled>
+  <input type="file" id="fileInput">
   <div style="margin-top:10px;">
-    <span class="status" id="status"></span>
+    <span class="status" id="status">Puedes elegir el archivo ya mismo — se procesará en cuanto UnityPy termine de cargar arriba.</span>
   </div>
   <table id="assetTable" style="display:none;">
     <thead><tr><th>PathID</th><th>ClassID / Tipo</th><th>Nombre</th></tr></thead>
@@ -71,7 +71,7 @@ function log(msg, cls) {
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-let pyodide, currentEnv, selectedDumpText = '';
+let pyodide, pyodideReady = false, selectedDumpText = '';
 
 async function init() {
   try {
@@ -83,13 +83,33 @@ async function init() {
 
     log('Instalando UnityPy (puede tardar según tu conexión)...');
     await pyodide.runPythonAsync(`
-import micropip
-await micropip.install('UnityPy')
+import sys, types, micropip
+
+# texture2ddecoder (decodificación de píxeles comprimidos) requiere compilar
+# código nativo y Pyodide no tiene wheel puro-Python para eso. No lo usamos
+# para listar PathID/ClassID/dump de campos, así que lo simulamos con un
+# módulo vacío para que UnityPy pueda importarse sin él.
+for fake_mod in ['texture2ddecoder', 'astc_decomp']:
+    if fake_mod not in sys.modules:
+        sys.modules[fake_mod] = types.ModuleType(fake_mod)
+
+await micropip.install('UnityPy', deps=False)
+
+# Dependencias reales de UnityPy que sí tienen wheel compatible con Pyodide.
+for dep in ['attrs', 'brotli', 'requests']:
+    try:
+        await micropip.install(dep)
+    except Exception as e:
+        print(f'Aviso: no se pudo instalar {dep}: {e}')
+
+import UnityPy
+print('UnityPy version:', UnityPy.__version__)
     `);
 
     log('UnityPy instalado correctamente.', 'ok');
-    fileInput.disabled = false;
-    statusEl.textContent = 'Listo. Elige un archivo .assetbundle / .unity3d';
+    pyodideReady = true;
+    statusEl.textContent = '✓ Listo. Elige un archivo .assetbundle / .unity3d';
+    statusEl.style.color = 'var(--ok)';
   } catch (err) {
     log('ERROR instalando UnityPy: ' + err.message, 'err');
     log('Esto suele pasar si UnityPy depende de una librería nativa (brotli/lz4/zstandard) no disponible en Pyodide. Copia este error y lo resolvemos.', 'err');
@@ -100,6 +120,13 @@ fileInput.addEventListener('change', async (e) => {
   const file = e.target.files[0];
   if (!file) return;
 
+  if (!pyodideReady) {
+    statusEl.style.color = 'var(--err)';
+    statusEl.textContent = 'Todavía está cargando UnityPy (mira el recuadro de arriba). Espera unos segundos e inténtalo de nuevo.';
+    return;
+  }
+
+  statusEl.style.color = 'var(--accent)';
   statusEl.textContent = 'Leyendo y montando el bundle...';
   assetTable.style.display = 'none';
   dumpEl.style.display = 'none';
