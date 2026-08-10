@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Bundle Dumper — UnityPy en el navegador (Pyodide)</title>
+<style>
+  :root{
+    --bg:#0B0E14; --panel:#161A24; --border:#262C3A; --text:#E7E9EE;
+    --dim:#8890A0; --accent:#FFB454; --ok:#7FD97F; --err:#FF6B6B;
+    --mono:'IBM Plex Mono', ui-monospace, monospace;
+  }
+  *{box-sizing:border-box;}
+  body{background:var(--bg); color:var(--text); font-family:var(--mono); margin:0; padding:24px;}
+  h1{font-size:16px; font-weight:600; margin-bottom:4px;}
+  .sub{color:var(--dim); font-size:12.5px; margin-bottom:20px;}
+  .panel{background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:18px; margin-bottom:16px;}
+  #log{white-space:pre-wrap; font-size:12px; max-height:200px; overflow-y:auto; color:var(--dim);}
+  #log .ok{color:var(--ok);} #log .err{color:var(--err);}
+  input[type=file]{font-family:var(--mono); font-size:13px; color:var(--text);}
+  button{font-family:var(--mono); font-size:13px; background:var(--accent); color:#1a1400; border:none; border-radius:6px; padding:9px 16px; cursor:pointer; font-weight:600;}
+  button:disabled{opacity:.4; cursor:not-allowed;}
+  table{width:100%; border-collapse:collapse; font-size:12.5px; margin-top:12px;}
+  th,td{border-bottom:1px solid var(--border); text-align:left; padding:6px 8px;}
+  th{color:var(--dim); font-weight:500;}
+  tr:hover{background:#1a1e29; cursor:pointer;}
+  #dump{white-space:pre-wrap; font-size:12px; max-height:400px; overflow-y:auto; display:none;}
+  .status{font-size:12.5px; color:var(--accent);}
+</style>
+</head>
+<body>
+
+<h1>Bundle Dumper</h1>
+<div class="sub">UnityPy corriendo 100% en tu navegador vía Pyodide (WebAssembly) — nada se sube a un servidor.</div>
+
+<div class="panel">
+  <div id="log">Cargando Pyodide + UnityPy...</div>
+</div>
+
+<div class="panel">
+  <input type="file" id="fileInput">
+  <div style="margin-top:10px;">
+    <span class="status" id="status">Puedes elegir el archivo ya mismo — se procesará en cuanto UnityPy termine de cargar arriba.</span>
+  </div>
+  <table id="assetTable" style="display:none;">
+    <thead><tr><th>PathID</th><th>ClassID / Tipo</th><th>Nombre</th></tr></thead>
+    <tbody id="assetTbody"></tbody>
+  </table>
+</div>
+
+<div class="panel">
+  <button id="exportBtn" style="display:none;">Exportar dump (.txt)</button>
+  <pre id="dump"></pre>
+</div>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.2/full/pyodide.js"></script>
+<script>
+const logEl = document.getElementById('log');
+const statusEl = document.getElementById('status');
+const fileInput = document.getElementById('fileInput');
+const assetTable = document.getElementById('assetTable');
+const assetTbody = document.getElementById('assetTbody');
+const dumpEl = document.getElementById('dump');
+const exportBtn = document.getElementById('exportBtn');
+
+function log(msg, cls) {
+  const line = document.createElement('div');
+  if (cls) line.className = cls;
+  line.textContent = msg;
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+let pyodide, pyodideReady = false, selectedDumpText = '';
+
+async function init() {
+  try {
+    log('Iniciando runtime de Python (WebAssembly)...');
+    pyodide = await loadPyodide();
+
+    log('Instalando micropip...');
+    await pyodide.loadPackage('micropip');
+
+    log('Instalando UnityPy (puede tardar según tu conexión)...');
+    await pyodide.runPythonAsync(`
+import sys, types, micropip
+
+# texture2ddecoder (decodificación de píxeles comprimidos) requiere compilar
+# código nativo y Pyodide no tiene wheel puro-Python para eso. No lo usamos
+# para listar PathID/ClassID/dump de campos, así que lo simulamos con un
+# módulo vacío para que UnityPy pueda importarse sin él.
+for fake_mod in ['texture2ddecoder', 'astc_decomp']:
+    if fake_mod not in sys.modules:
+        sys.modules[fake_mod] = types.ModuleType(fake_mod)
+
+await micropip.install('UnityPy', deps=False)
+
+# Dependencias reales de UnityPy que sí tienen wheel compatible con Pyodide.
+for dep in ['attrs', 'brotli', 'requests']:
+    try:
+        await micropip.install(dep)
+    except Exception as e:
+        print(f'Aviso: no se pudo instalar {dep}: {e}')
+
+import UnityPy
+print('UnityPy version:', UnityPy.__version__)
+    `);
+
+    log('UnityPy instalado correctamente.', 'ok');
+    pyodideReady = true;
+    statusEl.textContent = '✓ Listo. Elige un archivo .assetbundle / .unity3d';
+    statusEl.style.color = 'var(--ok)';
+  } catch (err) {
+    log('ERROR instalando UnityPy: ' + err.message, 'err');
+    log('Esto suele pasar si UnityPy depende de una librería nativa (brotli/lz4/zstandard) no disponible en Pyodide. Copia este error y lo resolvemos.', 'err');
+  }
+}
+
+fileInput.addEventListener('change', async (e) => {
+  const file = e.target.files[0];
+  if (!file) return;
+
+  if (!pyodideReady) {
+    statusEl.style.color = 'var(--err)';
+    statusEl.textContent = 'Todavía está cargando UnityPy (mira el recuadro de arriba). Espera unos segundos e inténtalo de nuevo.';
+    return;
+  }
+
+  statusEl.style.color = 'var(--accent)';
+  statusEl.textContent = 'Leyendo y montando el bundle...';
+  assetTable.style.display = 'none';
+  dumpEl.style.display = 'none';
+  exportBtn.style.display = 'none';
+
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    pyodide.FS.writeFile('/tmp/input.bundle', bytes);
+
+    const resultJson = await pyodide.runPythonAsync(`
+import UnityPy, json
+
+env = UnityPy.load('/tmp/input.bundle')
+items = []
+for obj in env.objects:
+    name = ''
+    try:
+        data = obj.read()
+        name = getattr(data, 'm_Name', '') or ''
+    except Exception:
+        pass
+    items.append({
+        'path_id': obj.path_id,
+        'class_id': obj.class_id,
+        'type': obj.type.name,
+        'name': name,
+    })
+json.dumps(items)
+    `);
+
+    const items = JSON.parse(resultJson);
+    currentEnv = true;
+
+    assetTbody.innerHTML = '';
+    items.forEach((it) => {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td>${it.path_id}</td><td>${it.type} (${it.class_id})</td><td>${it.name || '—'}</td>`;
+      tr.addEventListener('click', () => showDump(it.path_id));
+      assetTbody.appendChild(tr);
+    });
+    assetTable.style.display = items.length ? 'table' : 'none';
+    statusEl.textContent = `${items.length} objetos encontrados. Haz clic en uno para ver su dump.`;
+  } catch (err) {
+    statusEl.textContent = '';
+    log('ERROR leyendo el bundle: ' + err.message, 'err');
+  }
+});
+
+async function showDump(pathId) {
+  dumpEl.style.display = 'block';
+  dumpEl.textContent = 'Generando dump...';
+  try {
+    const dumpText = await pyodide.runPythonAsync(`
+import UnityPy, json
+
+env = UnityPy.load('/tmp/input.bundle')
+target = None
+for obj in env.objects:
+    if obj.path_id == ${pathId}:
+        target = obj
+        break
+
+if target is None:
+    result = "No encontrado."
+else:
+    try:
+        data = target.read()
+        try:
+            d = data.parse_as_dict()
+        except Exception:
+            d = {k: str(v) for k, v in vars(data).items() if not k.startswith('_')}
+        result = json.dumps(d, indent=2, default=str, ensure_ascii=False)
+    except Exception as e:
+        result = f"No se pudo parsear campo a campo ({e}).\\nInfo básica: PathID={target.path_id}, ClassID={target.class_id}, Tipo={target.type.name}"
+
+result
+    `);
+    selectedDumpText = dumpText;
+    dumpEl.textContent = dumpText;
+    exportBtn.style.display = 'inline-block';
+  } catch (err) {
+    dumpEl.textContent = 'ERROR generando dump: ' + err.message;
+  }
+}
+
+exportBtn.addEventListener('click', () => {
+  const blob = new Blob([selectedDumpText], { type: 'text/plain' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'dump.txt';
+  a.click();
+  URL.revokeObjectURL(url);
+});
+
+init();
+</script>
+
+</body>
+</html>
